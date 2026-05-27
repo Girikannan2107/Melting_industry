@@ -1,0 +1,38 @@
+# --- Web & API Server ---
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+aiofiles>=23.2.1
+
+# --- Configuration & Validation ---
+pydantic>=2.4.2
+pydantic-settings>=2.0.3
+
+# --- Background Processing & Message Queue ---
+celery>=5.3.4
+redis>=5.0.1
+
+# --- Database Integration ---
+motor>=3.3.1
+
+# --- Machine Learning & OCR Pipelines ---
+# Note: For Windows with NVIDIA GPU, PyTorch should ideally be installed 
+# separately using the command line flag: --index-url https://download.pytorch.org/whl/cu118
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+transformers>=4.35.0
+
+# PaddleOCR and its GPU backend
+paddlepaddle-gpu>=2.5.1
+paddleocr>=2.7.0.3
+
+# --- Image Processing & Utilities ---
+opencv-python-headless>=4.8.1.78
+numpy>=1.26.2
+Pillow>=10.0.1
+openpyxl>=3.1.2
+pymupdf>=1.27.2.3
+
+# --- Deployment & Observability ---
+gunicorn>=21.2.0
