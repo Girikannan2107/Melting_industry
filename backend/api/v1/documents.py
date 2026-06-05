@@ -39,7 +39,6 @@ async def upload_and_process_document(file: UploadFile = File(...), db = Depends
     try:
         extracted_results = await run_in_threadpool(ocr_engine.process_document, file_path)
         
-        # Enhanced debugging log
         print(f"DEBUG - Extracted results payload: {extracted_results}")
         
         if isinstance(extracted_results, dict) and "error" in extracted_results:
@@ -60,7 +59,6 @@ async def upload_and_process_document(file: UploadFile = File(...), db = Depends
             "data": extracted_results 
         }
     except HTTPException as he:
-        # Do not let our explicit HTTP exceptions get swallowed by the generic 500 block
         raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Processing failed inside route: {str(e)}")
@@ -80,78 +78,92 @@ async def get_all_processed_documents(db = Depends(get_db)):
 @router.get("/documents/export")
 async def export_all_data_to_excel(db = Depends(get_db)):
     """
-    Aggregates all processed document records, converts to an Excel sheet,
-    and returns it as a downloadable attachment with structural verification safety.
+    Aggregates all processed document records and dynamically builds a multi-sheet Excel file 
+    mapped to the Induction Furnace schema.
     """
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection is not initialized.")
         
     try:
-        # Added $match guard to ensure we only target documents that actually contain table arrays
-        pipeline = [
-            {
-                '$match': {
-                    'extracted_data.table_data': {'$exists': True, '$type': 'array'}
-                }
-            },
-            {
-                '$unwind': '$extracted_data.table_data'
-            }, 
-            {
-                '$project': {
-                    '_id': 0, 
-                    'date': {'$ifNull': ['$extracted_data.table_data.date', 'N/A']}, 
-                    'heat_no': {'$ifNull': ['$extracted_data.table_data.heat_no', 'N/A']}, 
-                    'item': {'$ifNull': ['$extracted_data.table_data.item', 'N/A']}, 
-                    'grade': {'$ifNull': ['$extracted_data.table_data.grade', 'N/A']}, 
-                    'customer': {'$ifNull': ['$extracted_data.table_data.customer', 'N/A']}, 
-                    'planned_pouring_weight': {'$ifNull': ['$extracted_data.table_data.planned_pouring_weight', '']}, 
-                    'pouring_time_planned': {'$ifNull': ['$extracted_data.table_data.pouring_time_planned', '']}, 
-                    'ladle_number': {'$ifNull': ['$extracted_data.table_data.ladle_number', '']}, 
-                    'tapping_sequence': {'$ifNull': ['$extracted_data.table_data.tapping_sequence', '']}, 
-                    'pouring_sequence': {'$ifNull': ['$extracted_data.table_data.pouring_sequence', '']}, 
-                    'pouring_time_sec': {'$ifNull': ['$extracted_data.table_data.pouring_time_sec', '']}, 
-                    'pouring_temperature': {'$ifNull': ['$extracted_data.table_data.pouring_temperature', '']}, 
-                    'metal_weight_before_kg': {'$ifNull': ['$extracted_data.table_data.metal_weight_before_kg', '']}, 
-                    'metal_weight_after_kg': {'$ifNull': ['$extracted_data.table_data.metal_weight_after_kg', '']}, 
-                    'kno_weight': {'$ifNull': ['$extracted_data.table_data.kno_weight', '']}, 
-                    'actual_liquid_poured_kg': {'$ifNull': ['$extracted_data.table_data.actual_liquid_poured_kg', '']}, 
-                    'weight_diff': {'$ifNull': ['$extracted_data.table_data.weight_diff', '']}, 
-                    'pouring_observation': {'$ifNull': ['$extracted_data.table_data.pouring_observation', '']}, 
-                    'weight_before_cutting': {'$ifNull': ['$extracted_data.table_data.weight_before_cutting', '']}
-                }
-            }
-        ]
-        
         collection = db["processed_documents"]
-        cursor = collection.aggregate(pipeline)
-        data = await cursor.to_list(length=10000)
+        cursor = collection.find({})
+        records = await cursor.to_list(length=10000)
         
-        columns = [
-            'date', 'heat_no', 'item', 'grade', 'customer', 'planned_pouring_weight',
-            'pouring_time_planned', 'ladle_number', 'tapping_sequence', 'pouring_sequence',
-            'pouring_time_sec', 'pouring_temperature', 'metal_weight_before_kg',
-            'metal_weight_after_kg', 'kno_weight', 'actual_liquid_poured_kg',
-            'weight_diff', 'pouring_observation', 'weight_before_cutting'
-        ]
+        summary_data = []
+        chemical_data = []
+        material_data = []
 
-        if not data:
-            df = pd.DataFrame(columns=columns)
-        else:
-            df = pd.DataFrame(data)
-            # Guarantee columns match expected layout sequence perfectly
-            df = df.reindex(columns=columns)
+        for record in records:
+            # Handle standard nested database wrapper if present, otherwise assume raw dump
+            data = record.get("extracted_data", record)
+            if not isinstance(data, dict):
+                continue
             
+            header = data.get("header", {})
+            melt_no = header.get("melt_number", "UNKNOWN")
+            
+            time_energy = data.get("time_and_energy", {})
+            process = data.get("process_parameters", {})
+            yield_dispatch = data.get("yield_and_dispatch", {})
+
+            # 1. Build Summary Row
+            summary_data.append({
+                "Melt Number": melt_no,
+                "Date": header.get("date", ""),
+                "Grade": header.get("grade", ""),
+                "Crucible No": header.get("crucible_no", ""),
+                "Furnace Started": time_energy.get("furnace_started_at", ""),
+                "Melt Tapped": time_energy.get("melt_tapped_at", ""),
+                "Total Time": time_energy.get("total_time_consumed", ""),
+                "Power Initial": time_energy.get("power_initial_reading", ""),
+                "Power Final": time_energy.get("power_final_reading", ""),
+                "Total Units": time_energy.get("power_total_units", ""),
+                "Tapping Temp (C)": process.get("tapping_temp_c", ""),
+                "Pouring Temp (C)": process.get("pouring_temp_c", ""),
+                "Total Metal Tapped (kg)": yield_dispatch.get("total_metal_tapped_kgs", ""),
+                "Total Charges (kg)": yield_dispatch.get("total_charges_kgs", ""),
+                "QC Remarks": yield_dispatch.get("qc_remarks", "")
+            })
+
+            # 2. Build Chemical Composition Rows
+            for chem in data.get("chemical_composition", []):
+                chemical_data.append({
+                    "Melt Number": melt_no,
+                    "Element": chem.get("element", ""),
+                    "Inti Min": chem.get("inti_min", ""),
+                    "Inti Max": chem.get("inti_max", ""),
+                    "UAPL Min": chem.get("uapl_min", ""),
+                    "UAPL Max": chem.get("uapl_max", ""),
+                    "Final Sample": chem.get("final_sample", "")
+                })
+
+            # 3. Build Materials/Charge Additions Rows
+            for scrap in data.get("scrap_and_returns", []):
+                material_data.append({"Melt Number": melt_no, "Category": "Scrap & Returns", "Material": scrap.get("material_name", ""), "Quantity (kg)": scrap.get("quantity_kgs", "")})
+            
+            for alloy in data.get("ferro_pure_alloys", []):
+                material_data.append({"Melt Number": melt_no, "Category": "Ferro/Pure Alloys", "Material": alloy.get("material_name", ""), "Quantity (kg)": alloy.get("quantity_kgs", "")})
+            
+            for deox in data.get("deoxidants", []):
+                material_data.append({"Melt Number": melt_no, "Category": "Deoxidants", "Material": deox.get("material_name", ""), "Quantity (kg)": deox.get("quantity_kgs", "")})
+
+        # Convert to Pandas DataFrames (with fallback empty schemas to prevent crash on 0 records)
+        df_summary = pd.DataFrame(summary_data) if summary_data else pd.DataFrame(columns=["Melt Number", "Date", "Grade"])
+        df_chem = pd.DataFrame(chemical_data) if chemical_data else pd.DataFrame(columns=["Melt Number", "Element", "Final Sample"])
+        df_mat = pd.DataFrame(material_data) if material_data else pd.DataFrame(columns=["Melt Number", "Category", "Material", "Quantity (kg)"])
+
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Pouring Data')
+            df_summary.to_excel(writer, index=False, sheet_name='Summary')
+            df_chem.to_excel(writer, index=False, sheet_name='Chemical Composition')
+            df_mat.to_excel(writer, index=False, sheet_name='Charge Additions')
             
         buffer.seek(0)
         
         return StreamingResponse(
             buffer,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=pouring_data.xlsx"}
+            headers={"Content-Disposition": "attachment; filename=induction_furnace_logs.xlsx"}
         )
         
     except Exception as e:

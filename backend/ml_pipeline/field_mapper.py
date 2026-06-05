@@ -33,61 +33,50 @@ class FieldMapper:
         combined_ocr_text = self._flatten_ocr_data(raw_data)
         
         prompt = f"""
-        You are an elite Industrial Data Extraction AI. 
-        I am providing you with the raw, imperfect OCR text from a Ladle Pouring Record.
+        You are an elite Industrial Metallurgical Data Extraction AI. 
+        I am providing you with the raw, imperfect OCR text from an Induction Furnace Melting Log Sheet.
         
-        Your task is to semantically analyze the text, correct any obvious OCR typos (e.g., 'Laddie' -> 'Ladle', 'Tem Pexqture' -> 'Temperature'), and map the values to the exact JSON schema provided. 
-        Use your intelligence to align the columns properly. For example, if you see 'WCB', that is the Grade. If you see 'Geco Special Machiners', that is the Customer.
+        Your task is to semantically analyze the text, correct any obvious OCR typos, and map the values to the exact JSON schema provided.
         
         RAW OCR TEXT:
         {combined_ocr_text}
         
         OUTPUT SCHEMA INSTRUCTIONS:
-        You MUST return ONLY a valid JSON object matching this exact structure. Do not invent data. If a field is missing, use an empty string "".
+        You MUST return ONLY a valid JSON object matching this exact structure. 
         
         {{
-          "document_info": {{
-            "date": "Extract the document date",
-            "heat_no": "Extract the Heat Number (e.g., A09600)",
-            "ladle_capacity": "Extract ladle capacity (e.g., '3 Ton')"
+          "header": {{
+            "date": "Extract Date", "grade": "Extract Grade", "melt_number": "Extract Melt Number", "crucible_no": "Extract Crucible No"
           }},
-          "pouring_details": {{
-            "excess_metal_ingot_kg": "Extract excess metal ingot as a number (e.g., 240.0)",
-            "pouring_temperatures": ["Array of pouring temperatures, e.g., '1534°C'"],
-            "ladle_temperature": "Extract ladle temperature, e.g., '786°C'"
+          "time_and_energy": {{
+            "furnace_started_at": "Time string", "sample_times": [], "melt_tapped_at": "", 
+            "total_time_consumed": "", "power_initial_reading": 0.0, "power_final_reading": 0.0, "power_total_units": 0.0
           }},
-          "table_data": [
+          "chemical_composition": [
             {{
-              "date": "Row Date (if any)",
-              "heat_no": "Row Heat No (e.g., A09600-01)",
-              "item": "Item description (e.g., BEARING HOUSING, TC-3000)",
-              "grade": "Material grade (e.g., WCB)",
-              "customer": "Customer Name",
-              "planned_pouring_weight": "Planned weight",
-              "pouring_time_planned": "Planned time",
-              "ladle_number": "Ladle No",
-              "tapping_sequence": "Tapping sequence number",
-              "pouring_sequence": "Pouring sequence number",
-              "pouring_time_sec": "Pouring time in seconds",
-              "metal_weight_before_kg": "Weight before pouring",
-              "metal_weight_after_kg": "Weight after pouring",
-              "kno_weight": "Kno weight",
-              "actual_liquid_poured_kg": "Actual liquid poured",
-              "weight_diff": "Difference in weight",
-              "pouring_observation": "Remarks or observations",
-              "weight_before_cutting": "Weight before cutting"
+              "element": "e.g., C, Mn, Si", "inti_min": 0.0, "inti_max": 0.0, "uapl_min": 0.0, "uapl_max": 0.0,
+              "bath_readings": [], "final_sample": 0.0
             }}
-          ]
+          ],
+          "scrap_and_returns": [],
+          "ferro_pure_alloys": [],
+          "deoxidants": [],
+          "process_parameters": {{
+            "tapping_temp_c": "", "pouring_temp_c": "", "shank_ladle_temp_c": "",
+            "lining_condition": "", "slag_condition": "", "shank_ladle_condition": "", "dissolved_gas_level": ""
+          }},
+          "yield_and_dispatch": {{
+            "total_charges_kgs": 0.0, "total_addition_kgs": 0.0, "total_metal_tapped_kgs": 0.0,
+            "no_of_moulds_poured": 0, "no_of_test_bars": 0, "qc_remarks": ""
+          }}
         }}
-        
-        RULES:
-        1. Ignore table headers (e.g., do not make a row where customer="Customer" or item="Item").
-        2. Ensure data aligns correctly. Do not put numbers in the Customer field unless it is an actual numbered customer code.
         """
 
-        # Fallback dictionary if API fails
+        # Update fallback data to match the new Pydantic Schema exactly
         fallback_data = {
-            "document_info": {}, "pouring_details": {}, "table_data": [], 
+            "header": {}, "time_and_energy": {}, "chemical_composition": [],
+            "scrap_and_returns": [], "ferro_pure_alloys": [], "deoxidants": [],
+            "process_parameters": {}, "yield_and_dispatch": {},
             "error": "AI Inference failed.", "raw_text_dump": combined_ocr_text
         }
 
@@ -96,7 +85,6 @@ class FieldMapper:
             return fallback_data
 
         try:
-            # DIRECT REST API CALL (Bypasses Google SDK & Protobuf conflicts completely)
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={self.api_key}"
             headers = {'Content-Type': 'application/json'}
             payload = {
@@ -107,7 +95,6 @@ class FieldMapper:
             response = requests.post(url, headers=headers, json=payload)
             response.raise_for_status()
             
-            # Parse the Gemini JSON response
             result = response.json()
             ai_text_response = result['candidates'][0]['content']['parts'][0]['text']
             
@@ -118,6 +105,4 @@ class FieldMapper:
             
         except Exception as e:
             print(f"AI Mapping Error: {e}")
-            if 'response' in locals():
-                print(f"API Response: {response.text}")
             return fallback_data
