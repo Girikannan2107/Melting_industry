@@ -195,9 +195,28 @@ class IntelligentDocumentProcessor:
                     "responseSchema": schema
                 }
             }
+            import time
             
-            response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
-            response.raise_for_status()
+            max_retries = 3
+            backoff_factor = 2
+            response = None
+            
+            for retry in range(max_retries + 1):
+                try:
+                    response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
+                    
+                    # If 503 (High Demand) or 429 (Rate Limit) occurs, retry with backoff
+                    if response.status_code in [503, 429] and retry < max_retries:
+                        wait_time = (backoff_factor ** retry) + 2
+                        print(f"⚠️ Google API returned {response.status_code}. Retrying in {wait_time} seconds (attempt {retry + 1}/{max_retries})...")
+                        time.sleep(wait_time)
+                        continue
+                    
+                    response.raise_for_status()
+                    break
+                except requests.exceptions.HTTPError as e:
+                    if retry == max_retries or (response is not None and response.status_code not in [503, 429]):
+                        raise e
             
             raw_text = response.json()['candidates'][0]['content']['parts'][0]['text']
             clean_text = self._repair_json(raw_text)
