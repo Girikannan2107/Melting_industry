@@ -81,13 +81,9 @@ async def export_all_data_to_excel(db = Depends(get_db)):
     Aggregates all processed document records and dynamically builds a multi-sheet Excel file 
     mapped to the Induction Furnace schema.
     """
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database connection is not initialized.")
-        
     try:
-        collection = db["processed_documents"]
-        cursor = collection.find({})
-        records = await cursor.to_list(length=10000)
+        repo = DocumentRepository(db)
+        records = await repo.get_all_documents()
         
         summary_data = []
         chemical_data = []

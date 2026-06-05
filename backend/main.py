@@ -8,7 +8,7 @@ from api.v1 import documents
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Connect to MongoDB at startup
-    db_client.connect()
+    await db_client.connect()
     yield
     # Disconnect from MongoDB at shutdown
     db_client.disconnect()

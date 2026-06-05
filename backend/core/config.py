@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "uploads"
     
     # MongoDB Settings
-    MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+    MONGO_URI: str = "mongodb+srv://madhurithika:Madhu222@cluster0.9ienqct.mongodb.net/?retryWrites=true&w=majority"
     DB_NAME: str = os.getenv("DB_NAME", "idp_production")
     
     # Celery / Redis Settings

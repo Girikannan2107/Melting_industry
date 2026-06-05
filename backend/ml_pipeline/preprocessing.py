@@ -8,7 +8,7 @@ class ImagePreprocessor:
         if file_path.lower().endswith('.pdf'):
             pdf_document = fitz.open(file_path)
             page = pdf_document.load_page(0)
-            pix = page.get_pixmap(dpi=300)
+            pix = page.get_pixmap(dpi=200)
             img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
             
             if pix.n == 4: img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
@@ -25,8 +25,10 @@ class ImagePreprocessor:
         if h > w:
             img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-        # Upscale for OCR accuracy
-        img = cv2.resize(img, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+        # Only upscale for OCR accuracy if the image is relatively low-resolution (max dimension < 1500)
+        h, w = img.shape[:2]
+        if max(h, w) < 1500:
+            img = cv2.resize(img, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
         
         # CRITICAL FIX: Gentle Contrast Enhancement instead of harsh B&W Thresholding
         # This prevents faded printed text from disappearing.
