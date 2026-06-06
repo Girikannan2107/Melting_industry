@@ -1,69 +1,120 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
-from fastapi.responses import StreamingResponse
-from fastapi.concurrency import run_in_threadpool
-from core.config import settings
-from ml_pipeline.engine import IntelligentDocumentProcessor
-from api.dependencies import get_db
-from database.repository import DocumentRepository
-import aiofiles
 import os
+import shutil
 import uuid
 import io
+from pathlib import Path
 import pandas as pd
 
-router = APIRouter()
+from fastapi import APIRouter, HTTPException, UploadFile, File, status, Depends
+from fastapi.responses import JSONResponse, StreamingResponse
 
-# Load the ML engine directly into the API memory (Bypassing Celery/Redis)
-print("Loading ML Models directly into FastAPI...")
-ocr_engine = IntelligentDocumentProcessor()
+from ml_pipeline.engine import process_document
+from api.dependencies import get_db
+from database.repository import DocumentRepository
+from core.config import settings
 
-@router.post("/documents/process")
-async def upload_and_process_document(file: UploadFile = File(...), db = Depends(get_db)):
+router = APIRouter(prefix="/documents", tags=["documents"])
+
+# Where uploaded files are temporarily stored
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+GEMINI_API_KEY = settings.GEMINI_API_KEY
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /api/v1/documents/process
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/process")
+async def process_document_route(file: UploadFile = File(...), db = Depends(get_db)):
     """
-    Accepts an industrial scan and processes it IMMEDIATELY, 
-    returning the extracted JSON data and storing it in the database.
+    Upload a melt-certificate PDF and return the extracted chemical data.
+
+    Success (200):
+        { "status": "success", "data": { "chemical_composition": [...], ... } }
+
+    Client error / AI error (400):
+        { "status": "error", "message": "..." }
+
+    Server error (500):
+        { "status": "error", "message": "..." }
     """
-    allowed_types = ["image/jpeg", "image/png", "application/pdf"]
-    if file.content_type not in allowed_types:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Use JPG, PNG, or PDF.")
+    # ── Validate file type ────────────────────────────────────────────────────
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only PDF files are accepted.",
+        )
 
-    file_extension = file.filename.split(".")[-1]
-    unique_filename = f"{uuid.uuid4().hex}.{file_extension}"
-    file_path = os.path.join(settings.UPLOAD_DIR, unique_filename)
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="GEMINI_API_KEY is not configured on the server.",
+        )
 
-    # Save file
-    async with aiofiles.open(file_path, 'wb') as out_file:
-        content = await file.read()
-        await out_file.write(content)
-
+    # ── Save upload to disk ───────────────────────────────────────────────────
+    safe_name = f"{uuid.uuid4().hex}.pdf"
+    save_path  = UPLOAD_DIR / safe_name
     try:
-        extracted_results = await run_in_threadpool(ocr_engine.process_document, file_path)
-        
-        print(f"DEBUG - Extracted results payload: {extracted_results}")
-        
-        if isinstance(extracted_results, dict) and "error" in extracted_results:
-            raise HTTPException(
-                status_code=422, 
-                detail=f"AI Extraction Pipeline Error: {extracted_results['error']}"
-            )
-            
-        # Save to database (MongoDB with automatic local JSON fallback)
-        task_id = uuid.uuid4().hex
-        repo = DocumentRepository(db)
-        await repo.save_document(task_id, extracted_results)
-        
-        return {
-            "message": "Document processed successfully",
-            "filename": unique_filename,
-            "task_id": task_id,
-            "data": extracted_results 
-        }
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing failed inside route: {str(e)}")
+        with save_path.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save uploaded file: {exc}",
+        )
 
-@router.get("/documents")
+    # ── Run ML pipeline ───────────────────────────────────────────────────────
+    result = process_document(str(save_path), GEMINI_API_KEY)
+
+    # ── Clean up temp file (best-effort) ──────────────────────────────────────
+    try:
+        save_path.unlink(missing_ok=True)
+    except Exception:
+        pass   # not critical
+
+    # ── Map engine result to HTTP response ────────────────────────────────────
+    if result.get("status") == "success":
+        # Save to database (MongoDB with automatic local JSON fallback)
+        try:
+            repo = DocumentRepository(db)
+            task_id = uuid.uuid4().hex
+            await repo.save_document(task_id, result.get("data"))
+        except Exception as db_exc:
+            # log or handle db write error but do not block return of success to user
+            print(f"Failed to save processed document to repository: {db_exc}")
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=result,
+        )
+
+    # Engine returned an error — decide on 400 vs 500
+    message = result.get("message", "Unknown error from ML pipeline.")
+
+    # 503 / network errors from Gemini are the server's problem, not the client's
+    is_server_fault = any(
+        kw in message.lower()
+        for kw in ("503", "unavailable", "network", "timeout", "conversion failed")
+    )
+    http_code = (
+        status.HTTP_503_SERVICE_UNAVAILABLE if "503" in message
+        else status.HTTP_500_INTERNAL_SERVER_ERROR if is_server_fault
+        else status.HTTP_400_BAD_REQUEST
+    )
+
+    return JSONResponse(
+        status_code=http_code,
+        content={"status": "error", "message": message},
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/v1/documents
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("")
 async def get_all_processed_documents(db = Depends(get_db)):
     """
     Retrieves all processed document records from the database or local file fallback.
@@ -73,13 +124,21 @@ async def get_all_processed_documents(db = Depends(get_db)):
         records = await repo.get_all_documents()
         return records
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve records: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve records: {str(e)}"
+        )
 
-@router.get("/documents/export")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/v1/documents/export
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/export")
 async def export_all_data_to_excel(db = Depends(get_db)):
     """
     Aggregates all processed document records and dynamically builds a multi-sheet Excel file 
-    mapped to the Induction Furnace schema.
+    mapped to the Induction Furnace schema. Works with local fallback too.
     """
     try:
         repo = DocumentRepository(db)
@@ -163,8 +222,23 @@ async def export_all_data_to_excel(db = Depends(get_db)):
         )
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to export data: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to export data: {str(e)}"
+        )
 
-@router.get("/documents/status/{task_id}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/v1/documents/status/{task_id}
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/status/{task_id}")
 async def get_processing_status(task_id: str):
-    return {"task_id": task_id, "status": "SYNC_MODE_ACTIVE", "message": "Redis is disabled. Check the main /process route for output."}
+    """
+    Keep this just so the frontend doesn't break if it checks status.
+    """
+    return {
+        "task_id": task_id,
+        "status": "SYNC_MODE_ACTIVE",
+        "message": "Redis is disabled. Check the main /process route for output."
+    }

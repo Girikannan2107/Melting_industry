@@ -3,7 +3,7 @@ fastapi>=0.104.1
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
 aiofiles>=23.2.1
-
+pdf2image
 # --- Configuration & Validation ---
 pydantic>=2.4.2
 pydantic-settings>=2.0.3
@@ -22,7 +22,6 @@ torch>=2.1.0
 torchvision>=0.16.0
 torchaudio>=2.1.0
 transformers>=4.35.0
-
 # PaddleOCR and its GPU backend
 paddlepaddle-gpu>=2.5.1
 paddleocr>=2.7.0.3

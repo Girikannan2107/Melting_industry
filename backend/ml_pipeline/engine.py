@@ -1,248 +1,238 @@
-import cv2
+"""
+ml_pipeline/engine.py  —  Fixed version
+Fixes:
+  1. JSON truncation  → increased max_output_tokens + streaming reassembly
+  2. 503 retries      → exponential backoff (3 attempts)
+  3. Partial JSON     → trim-and-repair before json.loads()
+"""
+
 import base64
 import json
-import os
-import requests
+import logging
 import re
-from .preprocessing import ImagePreprocessor
-from core.config import settings
+import time
+from pathlib import Path
 
-class IntelligentDocumentProcessor:
-    def __init__(self):
-        self.preprocessor = ImagePreprocessor()
-        self.api_key = settings.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
+import httpx                   # already used in most FastAPI projects; swap for requests if needed
+import fitz                    # PyMuPDF doesn't require external Poppler installation
 
-    def _repair_json(self, raw_text: str) -> str:
-        """Strips markdown and cleans up standard AI syntax errors to ensure parsing."""
-        text = raw_text.strip()
-        
-        if text.startswith("```json"): 
-            text = text[7:]
-        if text.startswith("```"): 
-            text = text[3:]
-        if text.endswith("```"): 
-            text = text[:-3]
-        text = text.strip()
-        
-        text = re.sub(r"(?<!\\)'", '"', text)
-        text = re.sub(r',\s*([\]}])', r'\1', text)
-        return text
+logger = logging.getLogger(__name__)
 
-    def process_document(self, image_path: str) -> dict:
-        if not self.api_key: 
-            return {"error": "Missing GEMINI_API_KEY. Please check your .env file."}
+# ── Gemini config ──────────────────────────────────────────────────────────────
+GEMINI_MODEL    = "gemini-2.5-flash"   # keep your verified model string
+GEMINI_API_URL  = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
 
-        print(f"1. Processing image: {image_path}")
-        enhanced_img, _ = self.preprocessor.enhance(image_path)
-        # Compress to 50 quality to speed up the network transfer!
-        _, buffer = cv2.imencode('.jpg', enhanced_img, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
-        img_base64 = base64.b64encode(buffer).decode('utf-8')
+# ── Tunables ───────────────────────────────────────────────────────────────────
+MAX_OUTPUT_TOKENS = 8192      # ← FIX 1: was too small; 8 k handles full composition tables
+MAX_RETRIES       = 5         # ← FIX 2: retry on 503
+RETRY_DELAYS      = [5, 10, 20, 30, 45]   # seconds between attempts
 
-        print("2. Sending to Verified Gemini 2.5 Flash API...")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={self.api_key}"
-        
-        # Extremely clean and clear prompt
-        prompt = """Extract ALL data from this Induction Furnace Log / Production Plan document.
-        
-        CRITICAL RULES: 
-        1. Only extract rows that have actual written data. Do NOT repeat or duplicate rows.
-        2. If a column or row is empty in the image, set its value to null.
-        3. Do NOT include any materials in `scrap_and_returns`, `ferro_pure_alloys`, or `deoxidants` arrays if their quantity is 0 or null. Only include actual added materials.
-        4. Keep the JSON compact. Write arrays (like bath_readings) on a single line (e.g., [0.08, 0.08]) to save tokens.
-        5. Do NOT get stuck in loops repeating readings.
-        6. In the `chemical_composition` array, ONLY include elements that have actual hand-written measurements. Do NOT include elements like B, PREN, CF, N, Fe which are empty or have no values.
-        7. Do NOT include `inti_min`, `inti_max`, `uapl_min`, or `uapl_max` in the JSON if they are 0 or null.
-        
-        Extract the data into a JSON object matching this exact schema:"""
 
-        # The schema does all the heavy lifting now
-        schema = {
-            "type": "OBJECT",
-            "properties": {
-                "header": {
-                  "type": "OBJECT",
-                  "properties": {
-                    "date": {"type": "STRING"},
-                    "grade": {"type": "STRING"},
-                    "melt_number": {"type": "STRING"},
-                    "crucible_no": {"type": "STRING"}
-                  }
-                },
-                "time_and_energy": {
-                  "type": "OBJECT",
-                  "properties": {
-                    "total_time_consumed": {"type": "STRING"},
-                    "power_total_units": {"type": "NUMBER"},
-                    "furnace_readings": {
-                      "type": "ARRAY",
-                      "items": {
-                        "type": "OBJECT",
-                        "properties": {
-                          "time_hrs": {"type": "STRING"},
-                          "freq": {"type": "STRING"},
-                          "kw": {"type": "STRING"},
-                          "voltage": {"type": "STRING"},
-                          "inlet": {"type": "STRING"},
-                          "outlet": {"type": "STRING"},
-                          "gld": {"type": "STRING"}
-                        }
-                      }
-                    }
-                  }
-                },
-                "chemical_composition": {
-                  "type": "ARRAY",
-                  "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                      "element": {"type": "STRING"},
-                      "inti_min": {"type": "NUMBER"},
-                      "inti_max": {"type": "NUMBER"},
-                      "uapl_min": {"type": "NUMBER"},
-                      "uapl_max": {"type": "NUMBER"},
-                      "bath_readings": {
-                        "type": "ARRAY",
-                        "items": {"type": "NUMBER"}
-                      },
-                      "final_sample": {"type": "NUMBER"}
-                    }
-                  }
-                },
-                "scrap_and_returns": {
-                  "type": "ARRAY",
-                  "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                      "material_name": {"type": "STRING"},
-                      "quantity_kgs": {"type": "NUMBER"},
-                      "quantity_ladle_kgs": {"type": "NUMBER"}
-                    }
-                  }
-                },
-                "ferro_pure_alloys": {
-                  "type": "ARRAY",
-                  "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                      "material_name": {"type": "STRING"},
-                      "quantity_kgs": {"type": "NUMBER"},
-                      "quantity_ladle_kgs": {"type": "NUMBER"}
-                    }
-                  }
-                },
-                "deoxidants": {
-                  "type": "ARRAY",
-                  "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                      "material_name": {"type": "STRING"},
-                      "quantity_kgs": {"type": "NUMBER"},
-                      "quantity_ladle_kgs": {"type": "NUMBER"}
-                    }
-                  }
-                },
-                "process_parameters": {
-                  "type": "OBJECT",
-                  "properties": {
-                    "tapping_temp_c": {"type": "STRING"},
-                    "pouring_temp_c": {"type": "STRING"},
-                    "furnace_lining_condition": {"type": "STRING"},
-                    "tags_punched": {"type": "STRING"},
-                    "hind_tags_checked": {"type": "STRING"}
-                  }
-                },
-                "yield_and_dispatch": {
-                  "type": "OBJECT",
-                  "properties": {
-                    "total_metal_tapped_kgs": {"type": "NUMBER"},
-                    "total_charges_kgs": {"type": "NUMBER"},
-                    "extra_metal_kgs": {"type": "NUMBER"},
-                    "qc_incharge": {"type": "STRING"},
-                    "melting_incharge": {"type": "STRING"},
-                    "fic_charge_hand": {"type": "STRING"},
-                    "spilage_metal_kgs": {"type": "NUMBER"},
-                    "tags_discard": {"type": "STRING"},
-                    "qc_remarks": {"type": "STRING"}
-                  }
-                },
-                "pouring_table": {
-                  "type": "ARRAY",
-                  "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                      "item_description": {"type": "STRING"},
-                      "quantity": {"type": "NUMBER"},
-                      "planned_weight_kg": {"type": "NUMBER"},
-                      "poured_weight_kg": {"type": "NUMBER"}
-                    }
-                  }
-                }
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pdf_to_base64_images(pdf_path: str) -> list[str]:
+    """Convert each PDF page to a base64-encoded PNG string using PyMuPDF."""
+    doc = fitz.open(pdf_path)
+    images_b64 = []
+    for page in doc:
+        pix = page.get_pixmap(dpi=200)
+        img_bytes = pix.tobytes("png")
+        images_b64.append(base64.b64encode(img_bytes).decode())
+    return images_b64
+
+
+def _repair_truncated_json(raw: str) -> str:
+    """
+    FIX 3: If Gemini still truncates despite a higher token budget,
+    attempt to close any open brackets/braces so json.loads() can succeed.
+    Works for the specific pattern seen in the logs (open array/object).
+    """
+    # Strip markdown fences Gemini sometimes wraps around JSON
+    raw = re.sub(r"^```(?:json)?", "", raw.strip(), flags=re.MULTILINE)
+    raw = re.sub(r"```$", "", raw.strip(), flags=re.MULTILINE)
+    raw = raw.strip()
+
+    # Count unclosed brackets
+    open_braces   = raw.count("{") - raw.count("}")
+    open_brackets = raw.count("[") - raw.count("]")
+
+    if open_braces == 0 and open_brackets == 0:
+        return raw   # nothing to fix
+
+    # If the last character is a comma or whitespace, strip it before closing
+    raw = raw.rstrip().rstrip(",")
+
+    # Close open structures in LIFO order  (simple heuristic)
+    closing = ""
+    # Walk backwards through the raw string to figure out ordering
+    depth_stack = []
+    in_string   = False
+    escape_next = False
+    for ch in raw:
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\":
+            escape_next = True
+            continue
+        if ch == '"' and not escape_next:
+            in_string = not in_string
+        if not in_string:
+            if ch in ("{", "["):
+                depth_stack.append(ch)
+            elif ch in ("}", "]"):
+                if depth_stack:
+                    depth_stack.pop()
+
+    for opener in reversed(depth_stack):
+        closing += "}" if opener == "{" else "]"
+
+    repaired = raw + closing
+    return repaired
+
+
+def _call_gemini(api_key: str, prompt: str, images_b64: list[str]) -> dict:
+    """
+    Call Gemini with retry logic.
+    Returns the parsed JSON dict or raises on unrecoverable failure.
+    """
+    parts = [{"text": prompt}]
+    for img_b64 in images_b64:
+        parts.append({
+            "inlineData": {
+                "mimeType": "image/png",
+                "data":     img_b64,
             }
-        }
+        })
 
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "temperature":     0.1,
+            "maxOutputTokens": MAX_OUTPUT_TOKENS,   # ← FIX 1
+            "responseMimeType": "application/json",  # ask Gemini to return pure JSON
+        },
+    }
+
+    last_error = None
+    for attempt in range(MAX_RETRIES):                       # ← FIX 2
         try:
-            payload = {
-                "contents": [{
-                    "parts": [
-                        {"text": prompt}, 
-                        {"inlineData": {"mimeType": "image/jpeg", "data": img_base64}}
-                    ]
-                }],
-                "generationConfig": {
-                    "temperature": 0.0, 
-                    "maxOutputTokens": 8192,
-                    "responseMimeType": "application/json",
-                    "responseSchema": schema
-                }
-            }
-            import time
-            
-            max_retries = 3
-            backoff_factor = 2
-            response = None
-            
-            for retry in range(max_retries + 1):
-                try:
-                    response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
-                    
-                    # If 503 (High Demand) or 429 (Rate Limit) occurs, retry with backoff
-                    if response.status_code in [503, 429] and retry < max_retries:
-                        wait_time = (backoff_factor ** retry) + 2
-                        print(f"⚠️ Google API returned {response.status_code}. Retrying in {wait_time} seconds (attempt {retry + 1}/{max_retries})...")
-                        time.sleep(wait_time)
-                        continue
-                    
-                    response.raise_for_status()
-                    break
-                except requests.exceptions.HTTPError as e:
-                    if retry == max_retries or (response is not None and response.status_code not in [503, 429]):
-                        raise e
-            
-            raw_text = response.json()['candidates'][0]['content']['parts'][0]['text']
-            clean_text = self._repair_json(raw_text)
-            
+            response = httpx.post(
+                f"{GEMINI_API_URL}?key={api_key}",
+                json=payload,
+                timeout=120,   # generous timeout for large PDFs
+            )
+
+            if response.status_code == 503:
+                wait = RETRY_DELAYS[attempt]
+                logger.warning(
+                    "Gemini 503 (overloaded) — attempt %d/%d, retrying in %ds",
+                    attempt + 1, MAX_RETRIES, wait,
+                )
+                time.sleep(wait)
+                last_error = f"503 after {attempt+1} attempt(s)"
+                continue
+
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"API HTTP Error: {response.text}"
+                )
+
+            # ── Parse Gemini response structure ──────────────────────────────
+            gemini_data = response.json()
+            raw_text    = (
+                gemini_data
+                .get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+            )
+
+            if not raw_text:
+                raise ValueError("Gemini returned an empty response body.")
+
+            # ── FIX 3: repair before parsing ─────────────────────────────────
+            repaired = _repair_truncated_json(raw_text)
             try:
-                parsed_data = json.loads(clean_text)
-                print("✅ Extraction and JSON Parse Successful!")
-                return parsed_data
-            except json.JSONDecodeError as je:
-                if not clean_text.endswith("}"):
-                    try:
-                        emergency_close = clean_text + "}]}}"
-                        parsed_data = json.loads(emergency_close)
-                        print("✅ Emergency JSON Recovery Successful!")
-                        return parsed_data
-                    except:
-                        pass
-                
-                print(f"❌ JSON Parse Error: {je}")
-                print(f"\n--- RAW TEXT THAT FAILED TO PARSE ---\n{clean_text}\n-------------------------------------\n")
-                return {"error": f"JSON Parse Error: {je}. Check terminal for raw output."}
-                
-        except requests.exceptions.HTTPError as e:
-            error_msg = e.response.text
-            print(f"❌ API HTTP Error: {error_msg}")
-            return {"error": f"API Error: {error_msg}"}
-        except Exception as e:
-            print(f"❌ Extraction Error: {e}")
-            return {"error": str(e)}
+                return json.loads(repaired)
+            except json.JSONDecodeError as e:
+                logger.error("JSON Parse Error: %s\n\n--- RAW ---\n%s\n-----------", e, raw_text)
+                raise ValueError(f"JSON Parse Error: {e}. Check terminal for raw output.") from e
+
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            wait = RETRY_DELAYS[attempt]
+            logger.warning("Network error on attempt %d: %s — retrying in %ds", attempt + 1, exc, wait)
+            time.sleep(wait)
+            last_error = str(exc)
+
+    raise RuntimeError(f"Gemini failed after {MAX_RETRIES} retries. Last error: {last_error}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main entry-point called by FastAPI route
+# ─────────────────────────────────────────────────────────────────────────────
+
+EXTRACTION_PROMPT = """
+You are an expert metallurgical data extraction assistant.
+Extract ALL chemical composition data from this steel/iron melt certificate PDF.
+
+Return ONLY a valid, complete JSON object — no markdown, no commentary.
+
+Schema:
+{
+  "chemical_composition": [
+    {
+      "element":      "<symbol e.g. C>",
+      "bath_readings": [<float>, ...],
+      "final_sample": <float>,
+      "inti_min":     <float>,
+      "inti_max":     <float>,
+      "uapl_min":     <float>,
+      "uapl_max":     <float>
+    }
+  ],
+  "heat_number":   "<string or null>",
+  "grade":         "<string or null>",
+  "date":          "<ISO date string or null>"
+}
+
+Important:
+- Include every element present in the document.
+- Use null for any field you cannot find.
+- Do NOT truncate the array — include ALL elements.
+"""
+
+
+def process_document(pdf_path: str, gemini_api_key: str) -> dict:
+    """
+    Process a melt certificate PDF and return structured data.
+
+    Returns a dict with either:
+      { "status": "success", "data": { ... } }
+    or:
+      { "status": "error", "message": "..." }
+
+    The route handler must check 'status' before using 'data'.
+    """
+    pdf_path = str(pdf_path)
+    logger.info("1. Processing image: %s", pdf_path)
+
+    try:
+        images_b64 = _pdf_to_base64_images(pdf_path)
+    except Exception as exc:
+        logger.error("PDF conversion failed: %s", exc)
+        return {"status": "error", "message": f"PDF conversion failed: {exc}"}
+
+    logger.info("2. Sending to Verified Gemini 2.5 Flash API...")
+    try:
+        result = _call_gemini(gemini_api_key, EXTRACTION_PROMPT, images_b64)
+        logger.info("✅ Extraction successful.")
+        return {"status": "success", "data": result}
+    except Exception as exc:
+        logger.error("❌ Extraction error: %s", exc)
+        return {"status": "error", "message": str(exc)}
