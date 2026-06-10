@@ -503,6 +503,20 @@ export default function Dashboard() {
                         <div><strong>Tags Punched/Checked:</strong> <span className="text-slate-200">{processParams.tags_punched || '—'} / {processParams.hind_tags_checked || '—'}</span></div>
                         <div><strong>Tags Discarded:</strong> <span className="text-slate-200">{yieldData.tags_discard || '—'}</span></div>
                       </div>
+
+                      {timeAndEnergy.sample_times && timeAndEnergy.sample_times.length > 0 && (
+                        <div className="p-3 bg-slate-950/50 rounded-xl border border-slate-800 lg:col-span-3">
+                          <span className="block text-[10px] uppercase text-slate-500 font-bold mb-1.5">Chemical Sampling Intervals</span>
+                          <div className="flex flex-wrap items-center gap-2 text-xs font-semibold font-mono">
+                            {timeAndEnergy.sample_times.map((t, idx) => (
+                              <React.Fragment key={idx}>
+                                {idx > 0 && <span className="text-slate-700 font-sans">→</span>}
+                                <span className="px-2 py-0.5 bg-slate-900 border border-slate-800 text-cyan-400 rounded-md">{t}</span>
+                              </React.Fragment>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
                   {yieldData.qc_remarks && (
@@ -541,7 +555,49 @@ export default function Dashboard() {
                     )}
                   </div>
                 </div>
+              </div>
 
+              {/* Charge Additions Detailed Tables */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-8 animate-fade-in">
+                {[
+                  { title: 'Scrap & Returns', data: result.scrap_and_returns || [], color: 'text-indigo-400' },
+                  { title: 'Ferro & Pure Alloys', data: result.ferro_pure_alloys || [], color: 'text-amber-400' },
+                  { title: 'Deoxidants', data: result.deoxidants || [], color: 'text-emerald-400' }
+                ].map((section, idx) => (
+                  <div key={idx} className="bg-slate-900/60 backdrop-blur-md p-6 rounded-2xl border border-slate-800 shadow-xl flex flex-col justify-between">
+                    <div>
+                      <div className="flex items-center justify-between border-b border-slate-850 pb-3 mb-4">
+                        <h3 className={`text-sm font-bold ${section.color}`}>{section.title}</h3>
+                        <span className="text-slate-500 text-[10px] uppercase font-bold tracking-wider">{section.data.length} items</span>
+                      </div>
+                      {section.data.length > 0 ? (
+                        <div className="divide-y divide-slate-800/40 text-xs">
+                          {section.data.map((item, i) => (
+                            <div key={i} className="flex justify-between items-center py-2.5">
+                              <span className="text-slate-300 font-semibold">{item.material_name}</span>
+                              <div className="text-right font-mono font-semibold">
+                                {item.quantity_kgs > 0 && (
+                                  <span className="text-slate-200 block text-xs">
+                                    {item.quantity_kgs} kg <span className="text-[10px] text-slate-500 font-sans">Furnace</span>
+                                  </span>
+                                )}
+                                {item.quantity_ladle_kgs > 0 && (
+                                  <span className="text-cyan-400 block text-xs">
+                                    {item.quantity_ladle_kgs} kg <span className="text-[10px] text-slate-500 font-sans">Ladle</span>
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="py-6 text-center text-slate-500 text-xs font-semibold">
+                          No additions detected
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
               </div>
             </div>
           )}

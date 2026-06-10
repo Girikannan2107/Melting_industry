@@ -48,51 +48,177 @@ def _pdf_to_base64_images(pdf_path: str) -> list[str]:
 
 def _repair_truncated_json(raw: str) -> str:
     """
-    FIX 3: If Gemini still truncates despite a higher token budget,
-    attempt to close any open brackets/braces so json.loads() can succeed.
-    Works for the specific pattern seen in the logs (open array/object).
+    Robust JSON repairer that handles truncation at any point:
+    - Inside a string (closes it)
+    - After a colon (appends null)
+    - After a comma (strips it)
+    - In the middle of an incomplete key-value pair or literal
     """
     # Strip markdown fences Gemini sometimes wraps around JSON
     raw = re.sub(r"^```(?:json)?", "", raw.strip(), flags=re.MULTILINE)
     raw = re.sub(r"```$", "", raw.strip(), flags=re.MULTILINE)
     raw = raw.strip()
 
-    # Count unclosed brackets
-    open_braces   = raw.count("{") - raw.count("}")
-    open_brackets = raw.count("[") - raw.count("]")
+    if not raw:
+        return "{}"
 
-    if open_braces == 0 and open_brackets == 0:
-        return raw   # nothing to fix
-
-    # If the last character is a comma or whitespace, strip it before closing
-    raw = raw.rstrip().rstrip(",")
-
-    # Close open structures in LIFO order  (simple heuristic)
-    closing = ""
-    # Walk backwards through the raw string to figure out ordering
-    depth_stack = []
-    in_string   = False
+    stack = []
+    in_string = False
     escape_next = False
-    for ch in raw:
+    
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
         if escape_next:
             escape_next = False
+            i += 1
             continue
         if ch == "\\":
             escape_next = True
+            i += 1
             continue
-        if ch == '"' and not escape_next:
+        if ch == '"':
             in_string = not in_string
-        if not in_string:
-            if ch in ("{", "["):
-                depth_stack.append(ch)
-            elif ch in ("}", "]"):
-                if depth_stack:
-                    depth_stack.pop()
+            if not in_string:
+                # Finished a string
+                if stack:
+                    container = stack[-1]
+                    if container["type"] == "object":
+                        if container["state"] in ("expect_key_or_close", "expect_key"):
+                            container["state"] = "expect_colon"
+                        elif container["state"] == "expect_value":
+                            container["state"] = "expect_comma_or_close"
+                    elif container["type"] == "array":
+                        if container["state"] in ("expect_value_or_close", "expect_value"):
+                            container["state"] = "expect_comma_or_close"
+            i += 1
+            continue
+            
+        if in_string:
+            i += 1
+            continue
+            
+        # Outside string
+        if ch in (" ", "\t", "\n", "\r"):
+            i += 1
+            continue
+            
+        if ch == "{":
+            stack.append({"type": "object", "state": "expect_key_or_close"})
+        elif ch == "[":
+            stack.append({"type": "array", "state": "expect_value_or_close"})
+        elif ch == "}":
+            if stack and stack[-1]["type"] == "object":
+                stack.pop()
+                if stack:
+                    parent = stack[-1]
+                    if parent["type"] == "object" and parent["state"] == "expect_value":
+                        parent["state"] = "expect_comma_or_close"
+                    elif parent["type"] == "array" and parent["state"] in ("expect_value_or_close", "expect_value"):
+                        parent["state"] = "expect_comma_or_close"
+        elif ch == "]":
+            if stack and stack[-1]["type"] == "array":
+                stack.pop()
+                if stack:
+                    parent = stack[-1]
+                    if parent["type"] == "object" and parent["state"] == "expect_value":
+                        parent["state"] = "expect_comma_or_close"
+                    elif parent["type"] == "array" and parent["state"] in ("expect_value_or_close", "expect_value"):
+                        parent["state"] = "expect_comma_or_close"
+        elif ch == ":":
+            if stack and stack[-1]["type"] == "object" and stack[-1]["state"] == "expect_colon":
+                stack[-1]["state"] = "expect_value"
+        elif ch == ",":
+            if stack:
+                container = stack[-1]
+                if container["type"] == "object" and container["state"] == "expect_comma_or_close":
+                    container["state"] = "expect_key"
+                elif container["type"] == "array" and container["state"] == "expect_comma_or_close":
+                    container["state"] = "expect_value"
+        elif ch in ("-", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "t", "f", "n"):
+            if stack:
+                container = stack[-1]
+                if container["type"] == "object" and container["state"] == "expect_value":
+                    container["state"] = "expect_comma_or_close"
+                elif container["type"] == "array" and container["state"] in ("expect_value_or_close", "expect_value"):
+                    container["state"] = "expect_comma_or_close"
+        i += 1
 
-    for opener in reversed(depth_stack):
-        closing += "}" if opener == "{" else "]"
+    repaired = raw
+    if in_string:
+        repaired += '"'
+        if stack:
+            container = stack[-1]
+            if container["type"] == "object":
+                if container["state"] in ("expect_key_or_close", "expect_key"):
+                    container["state"] = "expect_colon"
+                elif container["state"] == "expect_value":
+                    container["state"] = "expect_comma_or_close"
+            elif container["type"] == "array":
+                if container["state"] in ("expect_value_or_close", "expect_value"):
+                    container["state"] = "expect_comma_or_close"
 
-    repaired = raw + closing
+    # Get the last non-whitespace character of repaired string
+    last_char = ""
+    for ch in reversed(repaired):
+        if ch not in (" ", "\t", "\n", "\r"):
+            last_char = ch
+            break
+
+    # Resolve each open structure in the stack from inside out
+    while stack:
+        container = stack.pop()
+        if container["type"] == "object":
+            if container["state"] == "expect_key":
+                # Trailing comma, strip it
+                repaired = repaired.rstrip()
+                if repaired.endswith(","):
+                    repaired = repaired[:-1]
+                repaired += "}"
+            elif container["state"] == "expect_key_or_close":
+                repaired += "}"
+            elif container["state"] == "expect_colon":
+                repaired += ": null}"
+            elif container["state"] == "expect_value":
+                if last_char == ":":
+                    repaired += " null"
+                elif last_char in ("-", "."):
+                    repaired += "null"
+                elif last_char.isalpha() and last_char not in ("e", "s", "l"):  # not ending valid true/false/null
+                    # Strip partial word
+                    repaired = repaired.rstrip("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+                    repaired += "null"
+                repaired += "}"
+            elif container["state"] == "expect_comma_or_close":
+                # If the last character was a decimal point, append 0
+                if last_char == ".":
+                    repaired += "0"
+                repaired += "}"
+        elif container["type"] == "array":
+            if container["state"] == "expect_value":
+                # Trailing comma, strip it
+                repaired = repaired.rstrip()
+                if repaired.endswith(","):
+                    repaired = repaired[:-1]
+                repaired += "]"
+            elif container["state"] == "expect_value_or_close":
+                repaired += "]"
+            elif container["state"] == "expect_comma_or_close":
+                if last_char == ".":
+                    repaired += "0"
+                repaired += "]"
+        
+        # When closing this structure, it counts as completing a value for the parent container (if any)
+        if stack:
+            parent = stack[-1]
+            if parent["type"] == "object" and parent["state"] == "expect_value":
+                parent["state"] = "expect_comma_or_close"
+            elif parent["type"] == "array" and parent["state"] in ("expect_value_or_close", "expect_value"):
+                parent["state"] = "expect_comma_or_close"
+        # Reset last_char for the next container
+        last_char = "}" if container["type"] == "object" else "]"
+
     return repaired
 
 
@@ -158,6 +284,7 @@ def _call_gemini(api_key: str, prompt: str, images_b64: list[str]) -> dict:
 
             # ── FIX 3: repair before parsing ─────────────────────────────────
             repaired = _repair_truncated_json(raw_text)
+            logger.info("JSON Repair Debug: Raw len=%d, Repaired len=%d, Repaired ends with=%r", len(raw_text), len(repaired), repaired[-50:])
             try:
                 return json.loads(repaired)
             except json.JSONDecodeError as e:
@@ -179,32 +306,87 @@ def _call_gemini(api_key: str, prompt: str, images_b64: list[str]) -> dict:
 
 EXTRACTION_PROMPT = """
 You are an expert metallurgical data extraction assistant.
-Extract ALL chemical composition data from this steel/iron melt certificate PDF.
+Extract ALL data from the provided steel/iron Induction Furnace Melting Log Sheet (which may span multiple pages).
 
 Return ONLY a valid, complete JSON object — no markdown, no commentary.
 
-Schema:
+Important:
+- Include every field present in the document. 
+- Ensure you read both Page 1 (Furnace Logs, Chemistry, Yield) and Page 2 (Pouring Table).
+- For floats/numbers, extract them as numbers. Use null for any field you cannot find.
+- Correct obvious OCR/handwriting typos.
+
+Output strictly to this Schema:
 {
+  "header": {
+    "date": "<string>",
+    "grade": "<string>",
+    "melt_number": "<string>",
+    "crucible_no": "<string>"
+  },
+  "time_and_energy": {
+    "furnace_readings": [
+      {"time_hrs": "<string>", "freq": "<string>", "kw": "<string>", "voltage": "<string>", "inlet": "<string>", "outlet": "<string>", "gld": "<string>"}
+    ],
+    "furnace_started_at": "<string>",
+    "sample_times": ["<string>"],
+    "melt_tapped_at": "<string>",
+    "total_time_consumed": "<string>",
+    "power_initial_reading": <float>,
+    "power_final_reading": <float>,
+    "power_total_units": <float>
+  },
   "chemical_composition": [
     {
-      "element":      "<symbol e.g. C>",
-      "bath_readings": [<float>, ...],
-      "final_sample": <float>,
-      "inti_min":     <float>,
-      "inti_max":     <float>,
-      "uapl_min":     <float>,
-      "uapl_max":     <float>
+      "element": "<symbol e.g. C, Si, Mn>",
+      "inti_min": <float>,
+      "inti_max": <float>,
+      "uapl_min": <float>,
+      "uapl_max": <float>,
+      "bath_readings": [<float>],
+      "final_sample": <float>
     }
   ],
-  "heat_number":   "<string or null>",
-  "grade":         "<string or null>",
-  "date":          "<ISO date string or null>"
+  "scrap_and_returns": [
+    {"material_name": "<string>", "quantity_kgs": <float>, "quantity_ladle_kgs": <float>}
+  ],
+  "ferro_pure_alloys": [
+    {"material_name": "<string>", "quantity_kgs": <float>, "quantity_ladle_kgs": <float>}
+  ],
+  "deoxidants": [
+    {"material_name": "<string>", "quantity_kgs": <float>, "quantity_ladle_kgs": <float>}
+  ],
+  "process_parameters": {
+    "tapping_temp_c": "<string>",
+    "pouring_temp_c": "<string>",
+    "furnace_lining_condition": "<string>",
+    "slag_condition": "<string>",
+    "dissolved_gas_level": "<string>",
+    "hind_tags_checked": "<string>",
+    "tags_punched": "<string>"
+  },
+  "yield_and_dispatch": {
+    "total_charges_kgs": <float>,
+    "total_addition_kgs": <float>,
+    "total_metal_tapped_kgs": <float>,
+    "no_of_moulds_poured": <integer>,
+    "spilage_metal_kgs": <float>,
+    "extra_metal_kgs": <float>,
+    "tags_discard": "<string>",
+    "melting_incharge": "<string>",
+    "qc_incharge": "<string>",
+    "fic_charge_hand": "<string>",
+    "qc_remarks": "<string>"
+  },
+  "pouring_table": [
+    {
+      "item_description": "<string>",
+      "quantity": <integer>,
+      "planned_weight_kg": <float>,
+      "poured_weight_kg": <float>
+    }
+  ]
 }
-
-Important:
-- Include every element present in the document.
-- Use null for any field you cannot find.
-- Do NOT truncate the array — include ALL elements.
 """
 
 

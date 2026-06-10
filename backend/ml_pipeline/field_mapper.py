@@ -85,7 +85,7 @@ class FieldMapper:
             return fallback_data
 
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={self.api_key}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={self.api_key}"
             headers = {'Content-Type': 'application/json'}
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}],

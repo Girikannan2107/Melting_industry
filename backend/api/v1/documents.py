@@ -77,13 +77,16 @@ async def process_document_route(file: UploadFile = File(...), db = Depends(get_
     # ── Map engine result to HTTP response ────────────────────────────────────
     if result.get("status") == "success":
         # Save to database (MongoDB with automatic local JSON fallback)
+        task_id = uuid.uuid4().hex
         try:
             repo = DocumentRepository(db)
-            task_id = uuid.uuid4().hex
             await repo.save_document(task_id, result.get("data"))
         except Exception as db_exc:
             # log or handle db write error but do not block return of success to user
             print(f"Failed to save processed document to repository: {db_exc}")
+
+        # Add task_id to result so the frontend knows what ID to use for updates
+        result["task_id"] = task_id
 
         return JSONResponse(
             status_code=status.HTTP_200_OK,
@@ -108,6 +111,26 @@ async def process_document_route(file: UploadFile = File(...), db = Depends(get_
         status_code=http_code,
         content={"status": "error", "message": message},
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUT /api/v1/documents/{task_id}
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.put("/{task_id}")
+async def update_processed_document(task_id: str, data: dict, db = Depends(get_db)):
+    """
+    Update the extracted data of an existing document by task_id.
+    """
+    try:
+        repo = DocumentRepository(db)
+        await repo.save_document(task_id, data)
+        return {"status": "success", "message": "Document updated successfully."}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update document: {str(e)}"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

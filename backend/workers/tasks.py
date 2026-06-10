@@ -1,8 +1,9 @@
 from celery import Celery
-from core.config import settings
-from ml_pipeline.engine import IntelligentDocumentProcessor
 import asyncio
 from motor.motor_asyncio import AsyncIOMotorClient
+
+from core.config import settings
+from ml_pipeline.engine import process_document
 
 # Initialize Celery connected to Redis
 celery_app = Celery(
@@ -10,11 +11,6 @@ celery_app = Celery(
     broker=settings.REDIS_URI,
     backend=settings.REDIS_URI
 )
-
-# Initialize the ML Engine globally so models stay loaded in memory
-# between tasks (prevents reloading models on every API call)
-print("Loading ML Models into Worker Memory...")
-ocr_engine = IntelligentDocumentProcessor()
 
 async def save_results_to_db(task_id: str, data: dict):
     """Async helper to save JSON output to MongoDB."""
@@ -34,8 +30,15 @@ def process_document_task(self, file_path: str):
     The background task that runs the OCR pipeline.
     """
     try:
-        # 1. Run the heavy ML Pipeline
-        extracted_results = ocr_engine.process_document(file_path)
+        # 1. Run the heavy ML Pipeline using the updated standalone function
+        # We pass the GEMINI_API_KEY from settings directly to the function
+        extracted_results = process_document(file_path, settings.GEMINI_API_KEY)
+        
+        # If the engine returned an error, raise it so Celery knows the task failed
+        if extracted_results.get("status") == "error":
+            raise Exception(extracted_results.get("message"))
+            
+        data_payload = extracted_results.get("data", {})
         
         # 2. Save to Database (running async Mongo in a sync Celery thread)
         loop = asyncio.get_event_loop()
@@ -43,9 +46,9 @@ def process_document_task(self, file_path: str):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
         
-        loop.run_until_complete(save_results_to_db(self.request.id, extracted_results))
+        loop.run_until_complete(save_results_to_db(self.request.id, data_payload))
         
-        return {"status": "success", "data": extracted_results}
+        return {"status": "success", "data": data_payload}
         
     except Exception as e:
         # Log the error and fail the task gracefully
