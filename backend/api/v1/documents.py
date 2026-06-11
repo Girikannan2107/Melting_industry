@@ -66,6 +66,10 @@ async def process_document_route(file: UploadFile = File(...), db = Depends(get_
         )
 
     # ── Run ML pipeline ───────────────────────────────────────────────────────
+    # ADD THIS LINE TO DEBUG:
+    print(f"\n\n--- DEBUG: USING API KEY: '{(GEMINI_API_KEY or '')[:15]}...' length: {len(GEMINI_API_KEY or '')} ---\n\n")
+
+    # ── Run ML pipeline ───────────────────────────────────────────────────────
     result = process_document(str(save_path), GEMINI_API_KEY)
 
     # ── Clean up temp file (best-effort) ──────────────────────────────────────
