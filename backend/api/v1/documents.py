@@ -93,23 +93,49 @@ async def process_document_route(file: UploadFile = File(...), db = Depends(get_
             content=result,
         )
 
-    # Engine returned an error — decide on 400 vs 500
+    # Engine returned an error — decide on 400 vs 403 vs 429 vs 500
     message = result.get("message", "Unknown error from ML pipeline.")
 
+    # Detect project denial / key suspension
+    is_denied = any(
+        kw in message.lower()
+        for kw in ("403", "denied access", "permission_denied", "forbidden")
+    )
+    # Detect quota limits
+    is_quota = any(
+        kw in message.lower()
+        for kw in ("429", "quota exceeded", "resource_exhausted", "resource exhausted")
+    )
     # 503 / network errors from Gemini are the server's problem, not the client's
     is_server_fault = any(
         kw in message.lower()
         for kw in ("503", "unavailable", "network", "timeout", "conversion failed")
     )
-    http_code = (
-        status.HTTP_503_SERVICE_UNAVAILABLE if "503" in message
-        else status.HTTP_500_INTERNAL_SERVER_ERROR if is_server_fault
-        else status.HTTP_400_BAD_REQUEST
-    )
+
+    if is_denied:
+        http_code = status.HTTP_403_FORBIDDEN
+        user_message = (
+            "Gemini API key has been denied access (403 Forbidden). "
+            "Your Google Cloud/AI Studio project has been suspended or denied access. "
+            "Please update the GEMINI_API_KEY in the server's backend/.env file."
+        )
+    elif is_quota:
+        http_code = status.HTTP_429_TOO_MANY_REQUESTS
+        user_message = (
+            "Gemini API quota exceeded (429 Too Many Requests). "
+            "Your key has exceeded its rate limit or daily limit. "
+            "Please check your billing account or update the GEMINI_API_KEY in backend/.env."
+        )
+    elif is_server_fault or "503" in message:
+        http_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        user_message = f"Service temporarily unavailable: {message}"
+    else:
+        http_code = status.HTTP_400_BAD_REQUEST
+        user_message = message
 
     return JSONResponse(
         status_code=http_code,
-        content={"status": "error", "message": message},
+        content={"status": "error", "message": user_message},
     )
 
 

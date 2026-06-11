@@ -416,5 +416,11 @@ def process_document(pdf_path: str, gemini_api_key: str) -> dict:
         logger.info("✅ Extraction successful.")
         return {"status": "success", "data": result}
     except Exception as exc:
-        logger.error("❌ Extraction error: %s", exc)
-        return {"status": "error", "message": str(exc)}
+        err_msg = str(exc)
+        if "403" in err_msg or "permission_denied" in err_msg.lower():
+            logger.error("❌ Extraction error: %s. HINT: Your project/API key has been denied access by Google. Please check your credentials or update the key in backend/.env.", exc)
+        elif "429" in err_msg or "quota" in err_msg.lower():
+            logger.error("❌ Extraction error: %s. HINT: Quota exceeded for this API key. Please check your AI Studio billing details or request limits.", exc)
+        else:
+            logger.error("❌ Extraction error: %s", exc)
+        return {"status": "error", "message": err_msg}

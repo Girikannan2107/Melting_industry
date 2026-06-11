@@ -15,9 +15,8 @@ class DocumentRepository:
         }
         
         if self.collection is None:
-            print("MongoDB not available, saving to local JSON fallback...")
-            await self._save_to_local_fallback(record)
-            return
+            # Raise an exception instead of falling back
+            raise Exception("MongoDB is not available. Please check your connection string.")
             
         try:
             await self.collection.update_one(
@@ -27,8 +26,8 @@ class DocumentRepository:
             )
             print("Successfully saved processed document to MongoDB.")
         except Exception as e:
-            print(f"MongoDB write failed: {e}. Falling back to local JSON...")
-            await self._save_to_local_fallback(record)
+            # Raise an exception instead of falling back
+            raise Exception(f"MongoDB write failed: {e}")
 
     async def _save_to_local_fallback(self, record: Dict[str, Any]):
         fallback_path = os.path.join("uploads", "fallback_db.json")
