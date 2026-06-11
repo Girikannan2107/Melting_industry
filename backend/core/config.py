@@ -1,6 +1,10 @@
 import os
 from pydantic_settings import BaseSettings
 
+# Calculate the path to the root .env file (three levels up from backend/core/config.py)
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ENV_PATH = os.path.join(ROOT_DIR, ".env")
+
 class Settings(BaseSettings):
     # API Settings
     PROJECT_NAME: str = "IDP Production Engine"
@@ -18,7 +22,7 @@ class Settings(BaseSettings):
     REDIS_URI: str = os.getenv("REDIS_URI", "redis://localhost:6379/0")
     
     class Config:
-        env_file = ".env"
+        env_file = ENV_PATH
         case_sensitive = True
 
 settings = Settings()
